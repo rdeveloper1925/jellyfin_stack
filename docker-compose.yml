@@ -19,8 +19,10 @@ services:
       - FIREWALL_OUTBOUND_SUBNETS=${LAN_SUBNET},10.0.1.0/24,172.16.0.0/12
       - FIREWALL_INPUT_PORTS=${WEBUI_PORT},${PROWLARR_PORT}
       - TZ=${TZ}
-      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'wget -O- -nv --tries=10 --waitretry=5 --retry-connrefused --post-data "json={\"listen_port\":{{PORT}},\"current_network_interface\":\"{{VPN_INTERFACE}}\",\"random_port\":false,\"upnp\":false}" http://127.0.0.1:${WEBUI_PORT}/api/v2/app/setPreferences'
-      - VPN_PORT_FORWARDING_DOWN_COMMAND=/bin/sh -c 'wget -O- -nv --tries=3 --retry-connrefused --post-data "json={\"listen_port\":0,\"current_network_interface\":\"lo\"}" http://127.0.0.1:${WEBUI_PORT}/api/v2/app/setPreferences'
+      # Asia-safe TCP+TLS probes (IPs, not github.com/cloudflare.com hostnames).
+      # qbittorrent-init/20-sync-forwarded-port.sh is the listen-port source of truth;
+      # do not race qBittorrent with VPN_PORT_FORWARDING_UP_COMMAND.
+      - HEALTH_TARGET_ADDRESSES=1.1.1.1:443,8.8.8.8:443
     volumes:
       - ${CONFIG_ROOT}/gluetun:/gluetun
       - gluetun-runtime:/tmp/gluetun
@@ -34,6 +36,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 90s
     restart: unless-stopped
 
   qbittorrent:

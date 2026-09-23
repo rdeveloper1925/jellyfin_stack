@@ -69,9 +69,11 @@ flowchart TB
 | `docker-compose.yml` | Full stack definition |
 | `.env` | Your real configuration and secrets (gitignored) |
 | `.env.example` | Documented template — copy to `.env` and fill in |
-| `qbittorrent-init/` | qBittorrent path + forwarded-port sync on start |
-| `scripts/retry-pia-portforward.sh` | Optional forwarded-port check (logs only; does not restart) |
-| `DOKPLOY-IMPLEMENTATION-GUIDE.md` | Step-by-step Dokploy deployment and configuration walkthrough |
+| `qbittorrent-init/` | qBittorrent path + forwarded-port sync on start (must be root-owned on the deploy host) |
+| `scripts/sidecar-watchdog.sh` | Host watchdog: if Gluetun is up but 8080/9696/8191 are down, `compose up -d` |
+| `scripts/jellyfin-stack-sidecar-watchdog.service` / `.timer` | systemd oneshot + 2-minute timer (`After=docker.service`) |
+| `scripts/retry-pia-portforward.sh` | Deprecated wrapper around the sidecar watchdog |
+| `DOKPLOY-IMPLEMENTATION-GUIDE.md` | Step-by-step home-svr Dokploy deployment and configuration walkthrough |
 | `.gitignore` | Excludes `.env` and local `config/` directories |
 
 ## Container images
@@ -85,13 +87,13 @@ flowchart TB
 | Prowlarr | `lscr.io/linuxserver/prowlarr:2.5.2.5491-ls155` | VPN-routed via `network_mode: service:gluetun` |
 | FlareSolverr | `ghcr.io/flaresolverr/flaresolverr:v3.5.0` | VPN-routed; Prowlarr reaches it at `http://127.0.0.1:8191` |
 | Seerr | `ghcr.io/seerr-team/seerr:v3.4.1` | Config at `/app/config`; runs as UID 1000 |
-| Gluetun | `qmcgaw/gluetun:latest@sha256:f3fb345cd365acd1d89ee0f64db55a395f9d6789036aa0d6a48d56d79ebaf214` | PIA OpenVPN client and kill switch (pinned by digest) |
+| Gluetun | `qmcgaw/gluetun:latest@sha256:f3fb345cd365acd1d89ee0f64db55a395f9d6789036aa0d6a48d56d79ebaf214` | PIA OpenVPN client and kill switch (pinned by digest); health via `1.1.1.1:443` / `8.8.8.8:443`, `start_period: 90s` |
 
 All application images use [linuxserver.io](https://www.linuxserver.io/our-images) where available. Seerr and Gluetun are the exceptions. Image tags are pinned to specific versions for reproducible deployments; Gluetun is pinned by digest because it only publishes a rolling `latest` tag. Bump these tags deliberately rather than relying on `latest`.
 
 ## Prerequisites
 
-- A [Dokploy](https://dokploy.com) instance (primary) with a remote deploy target running Docker Compose
+- A [Dokploy](https://dokploy.com) instance on the **deploy host** (this stack runs on **home-svr**, not the mattapps primary node) with Docker Compose
 - [Tailscale](https://tailscale.com/) on the deploy host (for private admin UI access)
 - [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) installed on the deploy host (for Jellyfin public access)
 - A domain managed in Cloudflare (for the Jellyfin tunnel)
@@ -160,26 +162,26 @@ cp .env.example .env
 | `BIND_IP` | Bind address for admin UI ports. `0.0.0.0` exposes on all interfaces (LAN + Tailscale); a specific private IP (Tailscale `tailscale ip -4` or LAN IP) restricts access. Jellyfin is excluded. | `0.0.0.0` or `192.168.x.x` |
 | `OPENVPN_USER` | PIA username | `p1234567` |
 | `OPENVPN_PASSWORD` | PIA password | |
-| `SERVER_REGIONS` | Comma-separated PIA regions with port forwarding (from PIA serverlist API; used with `PORT_FORWARD_ONLY` in compose) | see `.env.example` |
+| `SERVER_REGIONS` | Comma-separated PIA regions with port forwarding (used with `PORT_FORWARD_ONLY` in compose). Keep this Asia-focused; a 100+ region dump is unnecessary. | `Algeria,India,China` |
 | `VPN_PORT_FORWARDING` | Enable PIA port forwarding in Gluetun | `on` |
 | `LAN_SUBNET` | LAN + Tailscale CIDRs for Gluetun firewall (comma-separated). Do not put Docker `10.0.0.0/8` here. | `192.168.2.0/24,100.64.0.0/10` |
 | `JELLYFIN_PUBLISHED_SERVER_URL` | Public Jellyfin URL (Cloudflare Tunnel hostname) | `https://movies.mattapps.org` |
 | `WEBUI_PORT` | qBittorrent web UI port | `8080` |
 | `PROWLARR_PORT` | Prowlarr web UI port (published on gluetun) | `9696` |
 
-In Dokploy, paste the same variables into the project's **Environment** tab on the **primary** instance. Compose substitutes `${VAR}` references in `docker-compose.yml`. VPN credentials are only passed to the Gluetun service block — other containers do not receive them. A leftover `DOCKER_SUBNET` entry in Dokploy is unused and can be deleted.
+In Dokploy on **home-svr** (`https://dokploy.mattapps.org`), paste the same variables into the Jellyfin Stack **Environment** tab. Compose substitutes `${VAR}` references in `docker-compose.yml`. VPN credentials are only passed to the Gluetun service block — other containers do not receive them. Do **not** set `DOCKER_SUBNET` (compose hardcodes Docker CIDRs). Gluetun health probes are hardcoded in compose as `HEALTH_TARGET_ADDRESSES=1.1.1.1:443,8.8.8.8:443` — do not use github.com or cloudflare.com (Asia exits often fail those DNS/TLS checks and leave qBittorrent down).
 
 ## Dokploy deployment
 
-This stack is designed for a **remote deploy target** (secondary server) managed from a primary Dokploy instance. Traefik on the deploy host is not used for these services.
+This stack is deployed by **home-svr Dokploy** (`https://dokploy.mattapps.org`, compose `plex-stack-yfy5op`). It is **not** managed from the mattapps primary Dokploy node. Traefik on the deploy host is not used for these services.
 
-### 1. Create the project (primary Dokploy)
+### 1. Create the project (home-svr Dokploy)
 
-1. Open Dokploy → **Projects** → create or select a project.
-2. Add a **Docker Compose** service targeting your remote server.
-3. Point it at this repository or paste the contents of `docker-compose.yml`.
+1. Open home-svr Dokploy → **Projects** → create or select a project.
+2. Add a **Docker Compose** service on this host.
+3. Provider: GitHub App **Dokploy-Home-svr**. Repository: `rdeveloper1925/jellyfin_stack`, branch `master`, compose path `./docker-compose.yml`. Leave **Auto Deploy** off unless you already rely on it.
 
-   Deploy from the full repository so the `qbittorrent-init/` directory is present on the deploy host (required for automatic qBittorrent path configuration).
+   Deploy from the full repository so the `qbittorrent-init/` directory is present on the deploy host (required for automatic qBittorrent path configuration). After checkout, `qbittorrent-init/` must be **root-owned and executable** (`chown -R root:root` and `chmod 750` on the scripts) so linuxserver `/custom-cont-init.d` runs them without the not-owned-by-root warning. Mode `640` is skipped as "not an executable file". The sidecar watchdog re-applies that ownership when it runs as root.
 
 ### 2. Set environment variables
 
@@ -243,7 +245,7 @@ On first start, `qbittorrent-init/10-configure-paths.sh` (mounted via compose) a
 - Enables **Bypass authentication for clients on localhost** (required for Gluetun port-forward sync)
 - Creates `torrents/{movies,tv,incomplete}` under the `/data` mount
 
-`qbittorrent-init/20-sync-forwarded-port.sh` runs in the background on every start and retries syncing Gluetun's forwarded port into qBittorrent for up to 10 minutes (covers the race where Gluetun assigns a port before the Web UI is ready).
+`qbittorrent-init/20-sync-forwarded-port.sh` is the **source of truth** for the listen port. It runs in the background on every start and retries syncing Gluetun's forwarded port into qBittorrent for up to 10 minutes (covers the race where Gluetun assigns a port before the Web UI is ready). Compose does **not** set `VPN_PORT_FORWARDING_UP_COMMAND` — that raced qBittorrent and is not reliable.
 
 Manual steps after deploy:
 
@@ -255,7 +257,7 @@ Manual steps after deploy:
 3. Under **Settings → Downloads**, confirm default save path is `/data/torrents` and categories **`tv`** / **`movies`** point to `/data/torrents/tv` and `/data/torrents/movies` (should already be set).
 4. Under **Settings → Connection**, confirm **UPnP** is disabled (default in the linuxserver image).
 
-Gluetun (`PORT_FORWARD_ONLY=on`) selects PIA servers that support port forwarding and automatically updates qBittorrent's listening port when a port is assigned. A shared Docker volume (`gluetun-runtime`) exposes the forwarded port file to qBittorrent; the init script retries the sync if Gluetun beats the Web UI on startup. The compose file also sets a 10s stop grace period so redeploys do not abruptly kill active downloads.
+Gluetun (`PORT_FORWARD_ONLY=on`) selects PIA servers that support port forwarding. A shared Docker volume (`gluetun-runtime`) exposes the forwarded port file to qBittorrent; the init script retries the sync if Gluetun beats the Web UI on startup. The compose file also sets a 10s stop grace period so redeploys do not abruptly kill active downloads.
 
 ### Prowlarr
 
@@ -312,14 +314,15 @@ Gluetun (`PORT_FORWARD_ONLY=on`) selects PIA servers that support port forwardin
 
 ## Security
 
-- **VPN kill switch** — `network_mode: service:gluetun` on qBittorrent, Prowlarr, and FlareSolverr ensures they cannot reach the internet without an active VPN connection. Those sidecars use `depends_on` with `restart: true` so Compose restarts them when Gluetun is recreated (otherwise their ports stop responding until manually restarted).
+- **VPN kill switch** — `network_mode: service:gluetun` on qBittorrent, Prowlarr, and FlareSolverr ensures they cannot reach the internet without an active VPN connection. Those sidecars use `depends_on` with `restart: true` so Compose restarts them when Gluetun is recreated (otherwise their ports stop responding until manually restarted). A host **sidecar watchdog** (`scripts/sidecar-watchdog.sh`, systemd timer every 2 minutes, `After=docker.service`) runs `docker compose up -d` only when Gluetun is running and 8080/9696/8191 are not listening — the usual failure after a Docker daemon restart (`cannot join network namespace of a non running container`). It is log-only when healthy.
+- **Gluetun health** — compose sets `HEALTH_TARGET_ADDRESSES=1.1.1.1:443,8.8.8.8:443` and `start_period: 90s` so Asia exits can become healthy before sidecars start. Default github.com/cloudflare.com probes are a bad fit.
 - **Gluetun stays on `dokploy-network`** — Never switch Gluetun to `network_mode: host`; host-mode `tun0` routes break host cloudflared.
 - **Scoped credentials** — PIA credentials are only passed to the Gluetun container.
 - **Admin UI bind address** — Ports bind to `${BIND_IP}`. Set to `0.0.0.0` to reach UIs on both the LAN and Tailscale (ensure each app has authentication enabled), or a specific Tailscale/LAN IP to restrict exposure.
 - **Jellyfin via Cloudflare Tunnel** — Host `cloudflared` forwards `movies.mattapps.org` to `127.0.0.1:8096`; Jellyfin is not bound on `${BIND_IP}`. Use `TimeoutStartSec=60` on the cloudflared systemd unit.
 - **Authentication** — Set strong passwords on qBittorrent, Sonarr, Radarr, Prowlarr, and Jellyfin.
 - **Prowlarr exposure** — Only reachable on Tailscale; not exposed to the public internet.
-- **PIA port forwarding** — `SERVER_REGIONS` lists PIA regions with port forwarding support. Compose sets `PORT_FORWARD_ONLY=on` and hardcodes Docker outbound allowlists (`10.0.1.0/24`, `172.16.0.0/12`) so a Dokploy `DOCKER_SUBNET=10.0.0.0/8` cannot leak PIA's `10.x` control API off `tun0`.
+- **PIA port forwarding** — `SERVER_REGIONS` is Asia-focused (`Algeria,India,China`). Compose sets `PORT_FORWARD_ONLY=on` and hardcodes Docker outbound allowlists (`10.0.1.0/24`, `172.16.0.0/12`) so a leftover `DOCKER_SUBNET=10.0.0.0/8` cannot leak PIA's `10.x` control API off `tun0`. `LAN_SUBNET` must include the LAN CIDR **and** Tailscale `100.64.0.0/10`.
 - **Same filesystem** — Keep `torrents/` and `media/` on the same volume so hardlinks work and seeding continues after import.
 
 ## Maintenance
@@ -335,6 +338,22 @@ docker compose up -d
 ```
 
 linuxserver.io recommends pulling updated images manually rather than using auto-updaters like Watchtower.
+
+On home-svr, `docker-ce`, `docker-ce-cli`, `containerd.io`, and related Docker packages are `apt-mark hold` so an unattended `apt upgrade` cannot bounce the daemon and leave VPN sidecars exited.
+
+### Sidecar watchdog
+
+Install from this repo on the deploy host (once):
+
+```bash
+sudo install -m 755 scripts/sidecar-watchdog.sh /usr/local/sbin/jellyfin-stack-sidecar-watchdog.sh
+sudo install -m 644 scripts/jellyfin-stack-sidecar-watchdog.service /etc/systemd/system/
+sudo install -m 644 scripts/jellyfin-stack-sidecar-watchdog.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now jellyfin-stack-sidecar-watchdog.timer
+```
+
+Remove any leftover cron such as `*/10 * * * * .../retry-pia-portforward.sh`. The watchdog does **not** restart containers when a PIA forwarded port is missing.
 
 ### Backup
 
@@ -364,7 +383,7 @@ Gluetun sidecars share its network namespace. If Gluetun restarted but qBittorre
 
 - Check uptime mismatch: `docker ps --format "table {{.Names}}\t{{.Status}}" | grep -E "gluetun|qbittorrent|prowlarr|flaresolverr"`.
 - Confirm nothing is listening: `docker exec <gluetun-container-id> netstat -tlnp | grep -E "8080|9696"`.
-- Redeploy from Dokploy (compose sets `depends_on.restart: true` on the sidecars), or restart manually: `docker restart <qbittorrent-container-id> <prowlarr-container-id> <flaresolverr-container-id>`.
+- Redeploy from Dokploy (compose sets `depends_on.restart: true` on the sidecars), wait for the sidecar watchdog (every 2 minutes / after `docker.service`), or start only the sidecars: `docker compose -f /etc/dokploy/compose/plex-stack-yfy5op/code/docker-compose.yml up -d`.
 
 ### qBittorrent cannot be reached by Sonarr/Radarr
 
@@ -375,8 +394,10 @@ Gluetun sidecars share its network namespace. If Gluetun restarted but qBittorre
 ### VPN container is unhealthy
 
 - Check Gluetun logs: `docker logs <gluetun-container-id>`
-- Verify PIA credentials and `SERVER_REGIONS` spelling.
+- Verify PIA credentials and `SERVER_REGIONS` spelling (`Algeria,India,China`).
+- Confirm health targets are IPs (`1.1.1.1:443`), not github.com/cloudflare.com.
 - Ensure `/dev/net/tun` is available on the host.
+- Give Gluetun `start_period: 90s` before treating a slow Asia connect as a hard failure.
 
 ### Port forwarding not working
 
@@ -404,7 +425,7 @@ docker run --rm --network bridge curlimages/curl:8.5.0 -sS -o /dev/null -w "%{ht
 - Verify: `curl -sS -o /dev/null -w "%{http_code} %{time_total}\n" https://movies.mattapps.org/web/`
 - Check Gluetun logs for port-forward assignment messages: `docker logs <gluetun-container-id> 2>&1 | grep -i port`
 - The `20-sync-forwarded-port.sh` init script retries syncing the port for up to 10 minutes after each qBittorrent start.
-- Optional host check: `scripts/retry-pia-portforward.sh` logs if no forwarded port is assigned. It does **not** restart containers (a restart loop previously took down qBittorrent/Prowlarr/FlareSolverr whenever forwarding failed).
+- Host sidecar watchdog (`scripts/sidecar-watchdog.sh`) only acts when Gluetun is running and sidecar ports are down. It does **not** restart on port-forward failure.
 
 ### Permission errors on downloads or imports
 

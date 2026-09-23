@@ -4,7 +4,7 @@ Step-by-step instructions to deploy the Jellyfin + *arr media stack on [Dokploy]
 
 For architecture overview, security notes, and troubleshooting, see [README.md](README.md).
 
-This guide assumes a **primary Dokploy** instance deploying to a **remote server** (e.g. a home server on Tailscale). Traefik domains are **not** used for this stack.
+This stack is deployed by **home-svr Dokploy** (`https://dokploy.mattapps.org`), not the mattapps primary node. Traefik domains are **not** used for this stack. Git source: GitHub App **Dokploy-Home-svr** → `rdeveloper1925/jellyfin_stack` @ `master`, compose `./docker-compose.yml`.
 
 ---
 
@@ -12,7 +12,7 @@ This guide assumes a **primary Dokploy** instance deploying to a **remote server
 
 ### Checklist
 
-- [ ] Primary Dokploy installed and connected to the deploy target
+- [ ] home-svr Dokploy installed (`https://dokploy.mattapps.org`) with GitHub App **Dokploy-Home-svr**
 - [ ] [Tailscale](https://tailscale.com/) running on the deploy host
 - [ ] [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) installed on the deploy host
 - [ ] A domain in Cloudflare (`mattapps.org` — for the Jellyfin tunnel only)
@@ -91,6 +91,21 @@ ls -l /dev/net/tun
 
 If the file exists, you are good. Docker must run with privileges that allow `NET_ADMIN`.
 
+### Step 1.6 — Sidecar watchdog and Docker package hold
+
+After a Docker daemon restart, qBittorrent/Prowlarr/FlareSolverr can stay exited (`cannot join network namespace of a non running container`). Install the repo watchdog (systemd oneshot `After=docker.service` + 2-minute timer) and hold Docker packages so `apt upgrade` cannot bounce the daemon:
+
+```bash
+sudo install -m 755 scripts/sidecar-watchdog.sh /usr/local/sbin/jellyfin-stack-sidecar-watchdog.sh
+sudo install -m 644 scripts/jellyfin-stack-sidecar-watchdog.service /etc/systemd/system/
+sudo install -m 644 scripts/jellyfin-stack-sidecar-watchdog.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now jellyfin-stack-sidecar-watchdog.timer
+sudo apt-mark hold docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-ce-rootless-extras docker-compose-plugin
+```
+
+Remove any leftover `*/10 * * * * .../retry-pia-portforward.sh` cron. The watchdog is log-only when 8080/9696/8191 are listening.
+
 ---
 
 ## Phase 2: Configure environment
@@ -118,12 +133,12 @@ CONFIG_ROOT=/home/matt/PLEX/config
 # --- PIA VPN (Gluetun) ---
 OPENVPN_USER=p1234567
 OPENVPN_PASSWORD=your_pia_password
-SERVER_REGIONS=Netherlands,CA Toronto,Switzerland
+SERVER_REGIONS=Algeria,India,China
 VPN_PORT_FORWARDING=on
 
 # --- Network / access ---
 BIND_IP=100.x.x.x
-LAN_SUBNET=192.168.1.0/24,100.64.0.0/10
+LAN_SUBNET=192.168.2.0/24,100.64.0.0/10
 
 # --- Jellyfin ---
 JELLYFIN_PUBLISHED_SERVER_URL=https://movies.mattapps.org
@@ -142,8 +157,8 @@ PROWLARR_PORT=9696
 | `TZ` | Your [timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) |
 | `BIND_IP` | Tailscale IP from Step 1.4 |
 | `OPENVPN_USER` / `OPENVPN_PASSWORD` | PIA credentials |
-| `SERVER_REGIONS` | Comma-separated **non-US** PIA regions; compose sets `PORT_FORWARD_ONLY=on` |
-| `LAN_SUBNET` | Your LAN CIDR **and** `100.64.0.0/10` (Tailscale), comma-separated. Do not add `10.0.0.0/8`. Docker overlay/bridge allowlists are hardcoded in compose. |
+| `SERVER_REGIONS` | Asia-focused PIA regions (`Algeria,India,China`); compose sets `PORT_FORWARD_ONLY=on`. Do not paste the full PIA region list. |
+| `LAN_SUBNET` | Your LAN CIDR **and** `100.64.0.0/10` (Tailscale), comma-separated. Do not add `10.0.0.0/8`. Docker overlay/bridge allowlists are hardcoded in compose. Do not set `DOCKER_SUBNET`. |
 | `JELLYFIN_PUBLISHED_SERVER_URL` | `https://movies.mattapps.org` (Cloudflare Tunnel public hostname) |
 | `WEBUI_PORT` | Leave as `8080` unless you have a conflict |
 | `PROWLARR_PORT` | Leave as `9696` unless you have a conflict |
@@ -156,17 +171,18 @@ PROWLARR_PORT=9696
 
 ### Step 3.1 — Create a project
 
-1. Log in to your **primary** Dokploy instance.
+1. Log in to **home-svr Dokploy** (`https://dokploy.mattapps.org`).
 2. Go to **Projects** → **Create Project**.
-3. Name it (e.g. `media-stack`).
-4. Select the **remote deploy target** (your Tailscale server).
+3. Name it (e.g. `media-stack` / **Jellyfin Stack**).
 
 ### Step 3.2 — Add a Docker Compose service
 
 1. Inside the project, click **Create Service** → **Docker Compose**.
-2. Choose one of:
-   - **Git repository** — connect this repo and set compose file path to `docker-compose.yml`
-   - **Raw compose** — paste the contents of `docker-compose.yml`
+2. Provider: GitHub App **Dokploy-Home-svr**.
+3. Repository: `rdeveloper1925/jellyfin_stack`, branch `master`, compose path `./docker-compose.yml`.
+4. Leave **Auto Deploy** off unless you already rely on it.
+
+   If the App is installed but this service still shows an empty GitHub account, select **Dokploy-Home-svr**, then the `jellyfin_stack` repo. Grant the App access to `rdeveloper1925/jellyfin_stack` in GitHub if the repo is missing from the dropdown.
 
 ### Step 3.3 — Set environment variables in Dokploy
 
@@ -178,11 +194,13 @@ Dokploy injects these into Compose substitution (`${VAR}`). VPN credentials are 
 
 ### Step 3.4 — Verify compose settings
 
-- Compose file path: `docker-compose.yml`
-- Deploy from the **full Git repository** (not raw compose paste only) so `qbittorrent-init/` is available on the deploy host
+- Compose file path: `./docker-compose.yml`
+- Deploy from the **full Git repository** (`rdeveloper1925/jellyfin_stack`) so `qbittorrent-init/` is available on the deploy host
+- After checkout, `chown -R root:root qbittorrent-init && chmod 750 qbittorrent-init/*.sh` (linuxserver `/custom-cont-init.d` warns if not root-owned, and skips mode `640` as not executable). The sidecar watchdog re-applies this when it runs as root.
 - Do **not** add `container_name` to any service (breaks Dokploy logs/metrics)
 - The stack expects external network `dokploy-network` (Dokploy creates this on the deploy host)
 - **Do not assign Domains** in Dokploy for any service in this stack
+- Gluetun health is set in compose (`HEALTH_TARGET_ADDRESSES=1.1.1.1:443,8.8.8.8:443`, `start_period: 90s`). Do not use github.com/cloudflare.com health targets.
 
 ---
 
@@ -289,7 +307,7 @@ The returned IP should **not** match your home/server public IP.
 docker logs $(docker ps -q --filter "name=gluetun") 2>&1 | grep -iE "port forward|forwarded port"
 ```
 
-You should see a forwarded port assigned. If you see `API IP address not found`, confirm the running compose hardcodes Docker outbound CIDRs (`10.0.1.0/24,172.16.0.0/12`) and that `LAN_SUBNET` does not include `10.0.0.0/8`. Then try `SERVER_REGIONS` known to support PIA forwarding (e.g. `Netherlands,CA Toronto,Switzerland`) and redeploy. Compose already sets `PORT_FORWARD_ONLY=on`.
+You should see a forwarded port assigned. If you see `API IP address not found`, confirm the running compose hardcodes Docker outbound CIDRs (`10.0.1.0/24,172.16.0.0/12`) and that `LAN_SUBNET` does not include `10.0.0.0/8`. Keep `SERVER_REGIONS=Algeria,India,China` unless you intentionally change exits. Compose already sets `PORT_FORWARD_ONLY=on`. qBittorrent's listen port is synced by `qbittorrent-init/20-sync-forwarded-port.sh`, not by Gluetun `VPN_PORT_FORWARDING_UP_COMMAND`.
 
 ---
 
@@ -312,7 +330,7 @@ Configure in this order — later steps depend on earlier ones.
 
 URL: `http://<BIND_IP>:8080`
 
-The compose file mounts `qbittorrent-init/` to `/custom-cont-init.d`, which on every start sets save path `/data/torrents`, incomplete path `/data/torrents/incomplete`, category **`tv`** → `/data/torrents/tv`, category **`movies`** → `/data/torrents/movies`, and enables localhost auth bypass for Gluetun.
+The compose file mounts `qbittorrent-init/` to `/custom-cont-init.d` (must be **root-owned** on the host). On every start it sets save path `/data/torrents`, incomplete path `/data/torrents/incomplete`, category **`tv`** → `/data/torrents/tv`, category **`movies`** → `/data/torrents/movies`, and enables localhost auth bypass. `20-sync-forwarded-port.sh` is the listen-port source of truth.
 
 1. Get the temporary password from logs:
    ```bash
@@ -415,6 +433,9 @@ docker logs $(docker ps -q --filter "name=seerr") 2>&1 | tail -50
 | Jellyfin Published Server URL set to `https://movies.mattapps.org` | ☐ |
 | Seerr connected to Jellyfin, Sonarr, Radarr | ☐ |
 | `${CONFIG_ROOT}` backup scheduled | ☐ |
+| Sidecar watchdog timer enabled | ☐ |
+| Docker packages `apt-mark hold` on home-svr | ☐ |
+| GitHub App **Dokploy-Home-svr** → `rdeveloper1925/jellyfin_stack` | ☐ |
 
 ---
 
@@ -447,11 +468,11 @@ Admin UIs bind to `${BIND_IP}`. Jellyfin is excluded — use `https://movies.mat
 
 ### Redeploy after changes
 
-When you update `docker-compose.yml` or environment variables in Dokploy:
+When you update `docker-compose.yml` or environment variables in home-svr Dokploy:
 
-1. Save changes on the primary Dokploy instance.
-2. Click **Deploy**.
-3. Verify affected containers restarted cleanly.
+1. Save changes (GitHub provider + Environment). Prefer a careful `docker compose up -d` on the host so only changed services recreate — Jellyfin/Plex should stay up; VPN sidecars may bounce.
+2. Click **Deploy** only when you need Dokploy to re-clone. Leave Auto Deploy off.
+3. Verify affected containers restarted cleanly. Confirm the sidecar watchdog timer is enabled (`systemctl list-timers jellyfin-stack-sidecar-watchdog.timer`).
 
 ---
 

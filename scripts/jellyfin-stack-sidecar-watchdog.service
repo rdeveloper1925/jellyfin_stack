@@ -1,0 +1,12 @@
+[Unit]
+Description=Jellyfin stack sidecar watchdog
+After=docker.service
+Requires=docker.service
+# Re-run after Docker comes back (daemon upgrade/restart is the real sidecar-down bug).
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/jellyfin-stack-sidecar-watchdog.sh
+
+[Install]
+WantedBy=multi-user.target docker.service

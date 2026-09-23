@@ -20,13 +20,22 @@ sync_forwarded_port() {
 
     curl -sf -X POST "${WEBUI}/api/v2/app/setPreferences" \
         -H "Authorization: Bearer ${api_key}" \
+        -H "Referer: ${WEBUI}" \
+        -H "Origin: ${WEBUI}" \
         --data-urlencode "json={\"listen_port\":${port},\"random_port\":false,\"upnp\":false}" \
         >/dev/null
 }
 
 (
+    api_key=""
     for _ in $(seq 1 60); do
-        curl -sf "${WEBUI}/api/v2/app/version" >/dev/null 2>&1 && break
+        if [ -f "${CONF}" ]; then
+            api_key=$(grep -m1 '^WebUI\\APIKey=' "${CONF}" | cut -d= -f2-)
+        fi
+        [ -n "${api_key}" ] || { sleep 2; continue; }
+        curl -sf -H "Authorization: Bearer ${api_key}" \
+            -H "Referer: ${WEBUI}" -H "Origin: ${WEBUI}" \
+            "${WEBUI}/api/v2/app/version" >/dev/null 2>&1 && break
         sleep 2
     done
 
