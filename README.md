@@ -73,6 +73,8 @@ flowchart TB
 | `scripts/sidecar-watchdog.sh` | Host watchdog: if Gluetun is up but 8080/9696/8191 are down, `compose up -d` |
 | `scripts/jellyfin-stack-sidecar-watchdog.service` / `.timer` | systemd oneshot + 2-minute timer (`After=docker.service`) |
 | `scripts/retry-pia-portforward.sh` | Deprecated wrapper around the sidecar watchdog |
+| `scripts/remux-faststart.py` | Remux MP4/MOV episodes so the `moov` index is at the start (Jellyfin Direct Play). Run on the show/season folder **before** copying into `${MEDIA_ROOT}/media/` |
+| `scripts/fix-cloudflare-jellyfin-origin.sh` | Set the Cloudflare Tunnel origin for `movies.mattapps.org` to `http://127.0.0.1:8096` |
 | `DOKPLOY-IMPLEMENTATION-GUIDE.md` | Step-by-step home-svr Dokploy deployment and configuration walkthrough |
 | `.gitignore` | Excludes `.env` and local `config/` directories |
 
@@ -438,6 +440,27 @@ docker run --rm --network bridge curlimages/curl:8.5.0 -sS -o /dev/null -w "%{ht
 - Verify libraries point to `/data/media/movies` and `/data/media/tv` (container paths, not host paths).
 - Confirm files exist on the host under `${MEDIA_ROOT}/media/`.
 - Check that Sonarr/Radarr have successfully imported at least one file.
+
+### Jellyfin lists a title but it will not play (`movies.mattapps.org`)
+
+Files can be in the library (correct path, H.264 + AAC) and still fail in the browser when the MP4 **`moov` atom is at the end** of the file (not faststart). Direct Play over Cloudflare cannot seek to that index, so the player buffers forever or errors. Typical signs:
+
+- ffprobe/ffmpeg warning: `wrong sample count`
+- `ffprobe` shows a playable `h264` / `aac` stream
+- Jellyfin activity never logs a playback start for that title
+- Direct Play: `Accept-Ranges: none` or `Content-Type: video/quicktime`, Range requests ignored
+- Higher-bitrate titles of the same show may still play because they **transcode to HLS** instead of Direct Play
+
+**Fix:** remux with faststart (`ffmpeg -c copy -movflags +faststart`) so `moov` sits before `mdat`, then refresh the item in Jellyfin. Prefer doing this **before** copying into the library:
+
+```bash
+python3 scripts/remux-faststart.py --dry-run "/path/to/Show Name"
+python3 scripts/remux-faststart.py "/path/to/Show Name"
+```
+
+Requires `ffmpeg` on PATH. The script walks the folder recursively, skips files that already have faststart, and replaces each MP4/MOV only after the remux verifies. `--force` remuxes anyway.
+
+If the files are already in `${MEDIA_ROOT}/media/tv` (or `movies`), run it on that show/season directory, `chown` back to `PUID:PGID` if the remux ran as root, and refresh the series in Jellyfin so it re-probes size/ETag. Verify with a Range request: `206 Partial Content`, `Accept-Ranges: bytes`, `Content-Type: video/mp4`.
 
 ### Cloudflare Tunnel not reaching Jellyfin (502 Bad Gateway)
 
